@@ -1,14 +1,28 @@
+import os
 import re
 from datetime import datetime, timezone
 
 import requests
 import plotly.graph_objects as go
+from dotenv import load_dotenv
 
-KEEPA_API_KEY = "lc2vbp3rl8puivmg5a2a4ro9831as6qb3banbt36rk94nn7gkp8pvsj3n0i025ld"
+
+# Load env vars from a .env file.
+# If your .env is NOT in the same folder you run the script from,
+# either move it there or change this to an explicit path like:
+# load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+load_dotenv()
+
+KEEPA_API_KEY = os.getenv("KEEPA_API_KEY")
+if not KEEPA_API_KEY:
+    raise RuntimeError(
+        "Missing KEEPA_API_KEY. Put it in a .env file (KEEPA_API_KEY=...) and run from the folder that contains it."
+    )
+
 KEEPA_ENDPOINT = "https://api.keepa.com/product"
 DOMAIN_ID = 2  # UK for amazon.co.uk links
 
-#Keepa API CSV indices
+# Keepa API CSV indices
 IDX_AMAZON = 0
 IDX_NEW = 1
 IDX_BUYBOX = 18
@@ -16,7 +30,7 @@ IDX_RATING = 16
 IDX_REVIEWS = 17
 
 
-#Helpers
+# Helpers
 def extract_asin(text: str) -> str:
     text = text.strip()
     if re.fullmatch(r"[A-Z0-9]{10}", text, flags=re.IGNORECASE):
@@ -41,42 +55,9 @@ def keepa_minutes_to_dt_utc(keepa_minutes: int) -> datetime:
     return datetime.fromtimestamp(unix_seconds, tz=timezone.utc)
 
 
-def _pick_time_value(a, b):
-    """
-    Keepa is supposed to be (time, value), but be defensive:
-    Choose the orientation where 'time' looks like a real Keepa minute timestamp.
-    """
-    if a is None or b is None:
-        return None, None
-
-    a = int(a)
-    b = int(b)
-
-    def is_time(x: int) -> bool:
-        # Keepa minutes are >= 0; upper bound is generous
-        return 0 <= x <= 50_000_000
-
-    a_is_time = is_time(a)
-    b_is_time = is_time(b)
-
-    # If only one looks like time, pick it
-    if a_is_time and not b_is_time:
-        return a, b
-    if b_is_time and not a_is_time:
-        return b, a
-
-    # If both could be time, prefer the larger one as time (prices are usually smaller than time minutes)
-    if a_is_time and b_is_time:
-        if a >= b:
-            return a, b
-        return b, a
-
-    # fallback: treat as (time,value)
-    return a, b
-
-
 def parse_series(arr, min_time=None, price_series=False):
     """
+    Keepa arrays are ALWAYS: [time, value, time, value, ...]
     Returns x (datetimes) and y (ints).
     min_time: if set, ignore points before this Keepa-minute timestamp (use trackingSince).
     price_series: if True, drop 0 and negative values.
@@ -88,10 +69,13 @@ def parse_series(arr, min_time=None, price_series=False):
     n = len(arr) - (len(arr) % 2)
 
     for i in range(0, n, 2):
-        a, b = arr[i], arr[i + 1]
-        t, v = _pick_time_value(a, b)
+        t = arr[i]
+        v = arr[i + 1]
         if t is None or v is None:
             continue
+
+        t = int(t)
+        v = int(v)
 
         # Drop no-data markers
         if v in (-1, -2):
@@ -106,7 +90,7 @@ def parse_series(arr, min_time=None, price_series=False):
             continue
 
         xs.append(keepa_minutes_to_dt_utc(t))
-        ys.append(int(v))
+        ys.append(v)
 
     return xs, ys
 
@@ -117,17 +101,21 @@ def last_valid_value(arr, min_time=None, price_series=False):
 
     n = len(arr) - (len(arr) % 2)
     for i in range(n - 2, -1, -2):
-        a, b = arr[i], arr[i + 1]
-        t, v = _pick_time_value(a, b)
+        t = arr[i]
+        v = arr[i + 1]
         if t is None or v is None:
             continue
+
+        t = int(t)
+        v = int(v)
+
         if v in (-1, -2):
             continue
         if min_time is not None and t < int(min_time):
             continue
         if price_series and v <= 0:
             continue
-        return int(v)
+        return v
 
     return None
 
@@ -141,28 +129,34 @@ def fetch_keepa_product(asin: str) -> dict:
         "key": KEEPA_API_KEY,
         "domain": DOMAIN_ID,
         "asin": asin,
-        "history": 1,
-        "buybox": 1,
-        "rating": 1,
+        "stats": 1,     # include summary stats (safe)
+        "history": 1,   # include csv history arrays
     }
+
     r = requests.get(KEEPA_ENDPOINT, params=params, timeout=30)
-    r.raise_for_status()
+
+    if not r.ok:
+        try:
+            err = r.json()
+        except Exception:
+            err = r.text
+        raise RuntimeError(f"Keepa error {r.status_code}: {err}")
+
     data = r.json()
 
     products = data.get("products", [])
     if not products:
-        raise RuntimeError("No product returned. Check ASIN and DOMAIN_ID.")
+        raise RuntimeError(f"No product returned. Response: {data}")
     return products[0]
 
 
-#Main
+# Main
 def main():
     asin = extract_asin(input("Paste Amazon URL or ASIN: "))
     p = fetch_keepa_product(asin)
 
     title = p.get("title", asin)
     csv_data = p.get("csv", [])
-
     tracking_since = p.get("trackingSince")  # Keepa minutes when tracking began
 
     def get_arr(idx):
@@ -174,7 +168,7 @@ def main():
     rating_arr = get_arr(IDX_RATING)
     reviews_arr = get_arr(IDX_REVIEWS)
 
-    # current price: Buy Box -> New -> Amazon (but ignore pre-tracking junk and zero values)
+    # current price: Buy Box -> New -> Amazon (ignore pre-tracking + zero)
     current_int = (
         last_valid_value(buybox_arr, tracking_since, price_series=True)
         or last_valid_value(new_arr, tracking_since, price_series=True)
@@ -200,7 +194,7 @@ def main():
     if reviews is not None:
         print(f"Reviews:{reviews}")
 
-    # plot: Buy Box preferred else New else Amazon (filter out pre-tracking and zero values)
+    # plot: Buy Box preferred else New else Amazon
     x, y = parse_series(buybox_arr, tracking_since, price_series=True)
     series_name = "Buy Box"
 
